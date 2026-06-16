@@ -8,10 +8,16 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 # ==========================================
-# ⚙️ CONFIGURATION (CHANGE THESE)
+# ⚙️ CONFIGURATION (ENVIRONMENT VARIABLES)
 # ==========================================
-BOT_TOKEN = "8888367756:AAFyl7ll3ijCeP5j7Vi9xr1esnwzdlyh8oo" # Apna Bot Token Yahan Dalein
-OWNER_ID = 7197465675 # Apna Telegram User ID Yahan Dalein
+# Railway Dashboard -> Variables tab me ye dono set karein
+BOT_TOKEN = os.environ.get("BOT_TOKEN") 
+OWNER_ID_STR = os.environ.get("OWNER_ID")
+
+if not BOT_TOKEN or not OWNER_ID_STR:
+    raise ValueError("❌ ERROR: Please set BOT_TOKEN and OWNER_ID in your Railway Environment Variables!")
+
+OWNER_ID = int(OWNER_ID_STR)
 
 # ==========================================
 # 🚀 INITIALIZATION & SETUP
@@ -20,7 +26,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 DATA_FILE = "data.json"
 
-# RLock prevents deadlocks even if the same thread accesses it multiple times
 db_lock = threading.RLock() 
 
 default_data = {
@@ -47,10 +52,13 @@ def load_data():
             return default_data.copy()
 
 def save_data(data):
+    """ Atomic save to prevent JSON corruption during Railway restarts """
     with db_lock:
         try:
-            with open(DATA_FILE, "w") as f:
+            temp_file = DATA_FILE + ".tmp"
+            with open(temp_file, "w") as f:
                 json.dump(data, f, indent=4)
+            os.replace(temp_file, DATA_FILE)
         except Exception as e:
             logging.error(f"Error saving JSON: {e}")
 
@@ -98,6 +106,30 @@ def is_menu_button(text):
     buttons = ["👤 My Profile", "🔗 Refer & Earn", "🏦 Bind UPI", "💸 Withdraw", "🎁 Claim Promo"]
     return text in buttons or text.startswith('/')
 
+def process_referral_reward(user_id):
+    """ Centralized function to reward referrer exactly once """
+    uid = str(user_id)
+    notify_ref = False
+    ref_id_to_notify = None
+    
+    with db_lock:
+        u = get_user(uid)
+        if not u.get("joined", False):
+            u["joined"] = True
+            ref_id = u.get("referred_by")
+            if ref_id and ref_id in db["users"]:
+                db["users"][ref_id]["balance"] += 10.0
+                db["users"][ref_id]["referrals"] += 1
+                notify_ref = True
+                ref_id_to_notify = ref_id
+            save_data(db)
+            
+    if notify_ref and ref_id_to_notify:
+        try:
+            bot.send_message(ref_id_to_notify, f"🎉 **New Referral!**\nAapke dost ne bot/channel join kar liya hai. Aapke wallet me **₹10** add ho gaye hain! 💸")
+        except:
+            pass
+
 # ==========================================
 # 🎛️ KEYBOARDS
 # ==========================================
@@ -138,6 +170,7 @@ def start_command(message):
         
         get_user(user_id) 
 
+        # Save refer ID if genuinely new user
         if is_new_user and len(args) > 1:
             ref_id = str(args[1])
             with db_lock:
@@ -145,17 +178,24 @@ def start_command(message):
                     db["users"][user_id]["referred_by"] = ref_id
             save_data(db)
 
-        if not check_fsub(message.from_user.id):
+        # Check FSub status
+        has_joined = check_fsub(message.from_user.id)
+        
+        if not has_joined:
             bot.send_message(message.chat.id, "🛑 **Welcome to DhanSahi!**\n\nAapko bot use karne ke liye pehle hamara official channel join karna hoga.", reply_markup=fsub_keyboard())
             return
-
-        welcome_text = (
-            f"👋 **Welcome to DhanSahi Premium Bot!**\n\n"
-            f"🎉 Aapko **₹5 Signup Bonus** de diya gaya hai!\n"
-            f"🚀 Apne doston ko invite karein aur per refer **₹10** kamayein.\n\n"
-            f"Neeche diye gaye menu se options select karein 👇"
-        )
-        bot.send_message(message.chat.id, welcome_text, reply_markup=main_menu())
+        else:
+            # Bug Fix: If already joined or no FSub set, give refer reward immediately
+            process_referral_reward(user_id)
+            
+            welcome_text = (
+                f"👋 **Welcome to DhanSahi Premium Bot!**\n\n"
+                f"🎉 Aapko **₹5 Signup Bonus** de diya gaya hai!\n"
+                f"🚀 Apne doston ko invite karein aur per refer **₹10** kamayein.\n\n"
+                f"Neeche diye gaye menu se options select karein 👇"
+            )
+            bot.send_message(message.chat.id, welcome_text, reply_markup=main_menu())
+            
     except Exception as e:
         logging.error(f"Error in start: {e}")
 
@@ -171,27 +211,7 @@ def check_join_callback(call):
             except:
                 pass
             
-            notify_ref = False
-            ref_id_to_notify = None
-            
-            with db_lock:
-                u = get_user(user_id)
-                if not u.get("joined", False):
-                    u["joined"] = True
-                    ref_id = u.get("referred_by")
-                    if ref_id and ref_id in db["users"]:
-                        db["users"][ref_id]["balance"] += 10.0
-                        db["users"][ref_id]["referrals"] += 1
-                        notify_ref = True
-                        ref_id_to_notify = ref_id
-                save_data(db)
-            
-            if notify_ref:
-                try:
-                    bot.send_message(ref_id_to_notify, f"🎉 **New Referral!**\nAapke dost ne channel join kar liya hai. Aapke wallet me **₹10** add ho gaye hain! 💸")
-                except:
-                    pass
-            
+            process_referral_reward(user_id)
             bot.send_message(call.message.chat.id, "✅ **Verification Successful!**\n\nAb aap DhanSahi bot ke sabhi features use kar sakte hain.", reply_markup=main_menu())
         else:
             bot.answer_callback_query(call.id, "❌ Aapne abhi tak channel join nahi kiya hai! Pehle join karein.", show_alert=True)
@@ -254,10 +274,12 @@ def ask_upi(message):
 
 def save_upi(message):
     try:
-        if not message.text: return
+        if not message.text: 
+            bot.reply_to(message, "❌ Invalid text format. Try again.")
+            return
+            
         if is_menu_button(message.text):
-            # Pass the message back to the main message handler loop instead of ignoring
-            bot.process_new_messages([message]) 
+            bot.reply_to(message, "❌ Action Cancelled.")
             return
 
         user_id = str(message.from_user.id)
@@ -290,9 +312,12 @@ def ask_promo(message):
 
 def claim_promo(message):
     try:
-        if not message.text: return
+        if not message.text: 
+            bot.reply_to(message, "❌ Invalid text format.")
+            return
+            
         if is_menu_button(message.text):
-            bot.process_new_messages([message])
+            bot.reply_to(message, "❌ Action Cancelled.")
             return
 
         user_id = str(message.from_user.id)
@@ -544,22 +569,18 @@ def payout_worker():
 if __name__ == "__main__":
     logging.info("🚀 Starting DhanSahi Premium Bot...")
     
-    # 🔴 FIX: Delete conflicting webhooks before polling
     try:
         bot.remove_webhook()
         logging.info("Cleared previous webhooks.")
     except Exception as e:
         logging.error(f"Could not remove webhook: {e}")
 
-    # Start Worker
     worker_thread = threading.Thread(target=payout_worker, daemon=True)
     worker_thread.start()
     
-    # Retry loop for Polling (Crucial for Railway free-tier network drops)
     while True:
         try:
             logging.info("🤖 Bot is Polling...")
-            # Increased timeout values for weak network links
             bot.infinity_polling(timeout=20, long_polling_timeout=20)
         except Exception as e:
             logging.error(f"Polling Network Exception: {e}. Reconnecting in 3 seconds...")
