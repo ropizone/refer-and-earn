@@ -4,13 +4,14 @@ import time
 import random
 import threading
 import logging
+from datetime import datetime, timedelta
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 # ==========================================
 # ⚙️ CONFIGURATION (ENVIRONMENT VARIABLES)
 # ==========================================
-# Railway Dashboard -> Variables tab me ye dono set karein
+# Railway Dashboard -> Variables tab me ye set karein
 BOT_TOKEN = os.environ.get("BOT_TOKEN") 
 OWNER_ID_STR = os.environ.get("OWNER_ID")
 
@@ -33,9 +34,12 @@ default_data = {
     "promos": {},
     "config": {
         "channel_id": "", 
-        "channel_link": ""
+        "channel_link": "",
+        "min_withdraw": 190.0,
+        "signup_bonus": 5.0,
+        "refer_bonus": 10.0
     },
-    "payouts": [] 
+    "pending_withdrawals": [] # New: Store withdrawal requests here
 }
 
 def load_data():
@@ -52,7 +56,6 @@ def load_data():
             return default_data.copy()
 
 def save_data(data):
-    """ Atomic save to prevent JSON corruption during Railway restarts """
     with db_lock:
         try:
             temp_file = DATA_FILE + ".tmp"
@@ -72,53 +75,47 @@ def get_user(user_id):
     with db_lock:
         if uid not in db["users"]:
             db["users"][uid] = {
-                "balance": 5.0, # 🎉 Signup Bonus ₹5
+                "balance": db["config"]["signup_bonus"], 
                 "referred_by": None,
                 "referrals": 0,
                 "upi": None,
-                "joined": False
+                "joined": False, # Has passed FSub check?
+                "last_daily_bonus": 0 # Timestamp for daily bonus
             }
             save_data(db)
     return db["users"][uid]
 
-def mask_upi(upi):
-    try:
-        if '@' in upi:
-            u_part, b_part = upi.split('@', 1)
-            random_digits = str(random.randint(1000, 9999))
-            return f"{u_part}{random_digits}@{b_part}"
-        return f"{upi}{random.randint(1000, 9999)}"
-    except:
-        return f"***@bank"
-
 def check_fsub(user_id):
     channel_id = db["config"].get("channel_id", "")
     if not channel_id:
-        return True # Bypass if admin hasn't configured it
+        return True # Bypass if admin hasn't set channel
     try:
+        # User id must be integer for get_chat_member
         status = bot.get_chat_member(channel_id, int(user_id)).status
         return status in ['member', 'administrator', 'creator']
     except Exception as e:
-        logging.warning(f"FSub error (Allowing bypass to avoid blocking): {e}")
-        return True 
+        logging.warning(f"FSub error for {user_id}: {e}. (Make sure bot is Admin in channel and ID is correct e.g., @channelname)")
+        return False # Bug Fix: Agar error hai toh False return karo, join karna padega
 
 def is_menu_button(text):
-    buttons = ["👤 My Profile", "🔗 Refer & Earn", "🏦 Bind UPI", "💸 Withdraw", "🎁 Claim Promo"]
+    buttons = ["👤 My Profile", "🔗 Refer & Earn", "🏦 Bind UPI", "💸 Withdraw", "🎁 Claim Promo", "🎁 Daily Bonus"]
     return text in buttons or text.startswith('/')
 
 def process_referral_reward(user_id):
-    """ Centralized function to reward referrer exactly once """
+    """ Ek user ka refer reward ek hi baar dena """
     uid = str(user_id)
     notify_ref = False
     ref_id_to_notify = None
+    refer_amount = db["config"]["refer_bonus"]
     
     with db_lock:
         u = get_user(uid)
         if not u.get("joined", False):
-            u["joined"] = True
+            u["joined"] = True # Mark as officially joined
             ref_id = u.get("referred_by")
+            
             if ref_id and ref_id in db["users"]:
-                db["users"][ref_id]["balance"] += 10.0
+                db["users"][ref_id]["balance"] += refer_amount
                 db["users"][ref_id]["referrals"] += 1
                 notify_ref = True
                 ref_id_to_notify = ref_id
@@ -126,9 +123,12 @@ def process_referral_reward(user_id):
             
     if notify_ref and ref_id_to_notify:
         try:
-            bot.send_message(ref_id_to_notify, f"🎉 **New Referral!**\nAapke dost ne bot/channel join kar liya hai. Aapke wallet me **₹10** add ho gaye hain! 💸")
-        except:
-            pass
+            bot.send_message(
+                ref_id_to_notify, 
+                f"🎉 **New Referral Counted!**\n\nAapke dost ne channel join kar liya hai. Aapke wallet me **₹{refer_amount}** add ho gaye hain! 💸\nCheck your profile."
+            )
+        except Exception as e:
+            logging.error(f"Failed to notify referrer {ref_id_to_notify}: {e}")
 
 # ==========================================
 # 🎛️ KEYBOARDS
@@ -144,7 +144,8 @@ def main_menu():
         KeyboardButton("💸 Withdraw")
     )
     markup.add(
-        KeyboardButton("🎁 Claim Promo")
+        KeyboardButton("🎁 Claim Promo"),
+        KeyboardButton("🎁 Daily Bonus")
     )
     return markup
 
@@ -154,6 +155,21 @@ def fsub_keyboard():
     if link:
         markup.add(InlineKeyboardButton("📢 Join Our Channel", url=link))
     markup.add(InlineKeyboardButton("✅ I Have Joined", callback_data="check_join"))
+    return markup
+
+def admin_main_menu():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📢 Set FSub Channel", callback_data="adm_fsub"),
+        InlineKeyboardButton("💰 Edit User Balance", callback_data="adm_edit_bal")
+    )
+    markup.add(
+        InlineKeyboardButton("💸 Pending Withdrawals", callback_data="adm_withdrawals"),
+        InlineKeyboardButton("🎁 Create Promo", callback_data="adm_promo")
+    )
+    markup.add(
+        InlineKeyboardButton("📣 Broadcast Message", callback_data="adm_broadcast")
+    )
     return markup
 
 # ==========================================
@@ -170,7 +186,7 @@ def start_command(message):
         
         get_user(user_id) 
 
-        # Save refer ID if genuinely new user
+        # Save refer ID only if brand new user
         if is_new_user and len(args) > 1:
             ref_id = str(args[1])
             with db_lock:
@@ -182,17 +198,21 @@ def start_command(message):
         has_joined = check_fsub(message.from_user.id)
         
         if not has_joined:
-            bot.send_message(message.chat.id, "🛑 **Welcome to DhanSahi!**\n\nAapko bot use karne ke liye pehle hamara official channel join karna hoga.", reply_markup=fsub_keyboard())
+            bot.send_message(
+                message.chat.id, 
+                "🛑 **Welcome to DhanSahi!**\n\nBot ko use karne aur apne ₹5 Bonus ko claim karne ke liye, pehle hamara official channel join karein👇", 
+                reply_markup=fsub_keyboard()
+            )
             return
         else:
-            # Bug Fix: If already joined or no FSub set, give refer reward immediately
+            # Pura process verify hone ke baad refer reward do
             process_referral_reward(user_id)
             
             welcome_text = (
-                f"👋 **Welcome to DhanSahi Premium Bot!**\n\n"
-                f"🎉 Aapko **₹5 Signup Bonus** de diya gaya hai!\n"
-                f"🚀 Apne doston ko invite karein aur per refer **₹10** kamayein.\n\n"
-                f"Neeche diye gaye menu se options select karein 👇"
+                f"👋 **Welcome to DhanSahi Premium!**\n\n"
+                f"🎉 Aapko **₹{db['config']['signup_bonus']} Signup Bonus** mil chuka hai!\n"
+                f"🚀 Apne doston ko invite karein aur per refer **₹{db['config']['refer_bonus']}** kamayein.\n\n"
+                f"Neeche diye gaye menu se buttons dabayein 👇"
             )
             bot.send_message(message.chat.id, welcome_text, reply_markup=main_menu())
             
@@ -206,15 +226,20 @@ def check_join_callback(call):
         
         if check_fsub(call.from_user.id):
             try:
-                bot.answer_callback_query(call.id, "✅ Verification Successful!")
                 bot.delete_message(call.message.chat.id, call.message.message_id)
             except:
                 pass
             
+            # Yahan par count hoga refer finally!
             process_referral_reward(user_id)
-            bot.send_message(call.message.chat.id, "✅ **Verification Successful!**\n\nAb aap DhanSahi bot ke sabhi features use kar sakte hain.", reply_markup=main_menu())
+            
+            bot.send_message(
+                call.message.chat.id, 
+                "✅ **Verification Successful!**\n\nAb aap bot ke sabhi features use kar sakte hain.", 
+                reply_markup=main_menu()
+            )
         else:
-            bot.answer_callback_query(call.id, "❌ Aapne abhi tak channel join nahi kiya hai! Pehle join karein.", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ Aapne abhi tak channel join nahi kiya hai! Check failed.", show_alert=True)
     except Exception as e:
         logging.error(f"Error in check_join: {e}")
 
@@ -252,13 +277,41 @@ def refer(message):
         ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
         text = (
             f"🚀 **Refer & Earn Program** 🚀\n\n"
-            f"Apne doston ko invite karein aur kamayein **₹10** per valid refer!\n\n"
+            f"Apne doston ko invite karein aur kamayein **₹{db['config']['refer_bonus']}** per valid refer!\n\n"
             f"🔗 **Your Referral Link:**\n`{ref_link}`\n\n"
-            f"*(Note: Referral bonus tabhi milega jab aapka dost bot start karke channel join karega)*"
+            f"*(Note: Bonus tabhi milega jab aapka dost bot start karke channel join karega)*"
         )
         bot.reply_to(message, text)
     except Exception as e:
         logging.error(f"Error in refer: {e}")
+
+@bot.message_handler(func=lambda m: m.text == "🎁 Daily Bonus")
+def daily_bonus(message):
+    try:
+        user_id = str(message.from_user.id)
+        if not check_fsub(message.from_user.id):
+            bot.reply_to(message, "🛑 Pehle channel join karein!", reply_markup=fsub_keyboard())
+            return
+
+        u = get_user(user_id)
+        last_claim = u.get("last_daily_bonus", 0)
+        now = time.time()
+        
+        if now - last_claim >= 86400: # 24 hours
+            bonus_amount = random.randint(1, 5) # Random bonus between Rs 1 to 5
+            with db_lock:
+                db["users"][user_id]["balance"] += bonus_amount
+                db["users"][user_id]["last_daily_bonus"] = now
+                save_data(db)
+            bot.reply_to(message, f"🎁 **Daily Bonus Claimed!**\nAapko **₹{bonus_amount}** mile hain. Kal wapas aana! 💸")
+        else:
+            time_left = 86400 - (now - last_claim)
+            hours = int(time_left // 3600)
+            mins = int((time_left % 3600) // 60)
+            bot.reply_to(message, f"⏳ Aap apna aaj ka bonus le chuke ho.\nNext bonus aayega: **{hours} ghante aur {mins} minute** baad.")
+            
+    except Exception as e:
+        logging.error(f"Error in daily bonus: {e}")
 
 @bot.message_handler(func=lambda m: m.text == "🏦 Bind UPI")
 def ask_upi(message):
@@ -274,84 +327,24 @@ def ask_upi(message):
 
 def save_upi(message):
     try:
-        if not message.text: 
-            bot.reply_to(message, "❌ Invalid text format. Try again.")
-            return
-            
+        if not message.text: return
         if is_menu_button(message.text):
             bot.reply_to(message, "❌ Action Cancelled.")
             return
 
         user_id = str(message.from_user.id)
-        get_user(user_id) 
-        
         upi = message.text.strip()
         if len(upi) < 5 or "@" not in upi:
-            bot.reply_to(message, "❌ Invalid UPI ID. Kripya sahi UPI ID bhejein. Phir se '🏦 Bind UPI' button dabayein.")
+            bot.reply_to(message, "❌ Invalid UPI ID. Kripya sahi UPI ID bhejein (Bind UPI button firse dabayein).")
             return
 
         with db_lock:
             db["users"][user_id]["upi"] = upi
             save_data(db)
             
-        bot.reply_to(message, f"✅ **Success!** Aapka UPI ID `{upi}` successfully bind ho chuka hai.")
+        bot.reply_to(message, f"✅ **Success!** Aapka UPI ID `{upi}` save ho gaya hai.")
     except Exception as e:
         logging.error(f"Error in save_upi: {e}")
-
-@bot.message_handler(func=lambda m: m.text == "🎁 Claim Promo")
-def ask_promo(message):
-    try:
-        if not check_fsub(message.from_user.id):
-            bot.reply_to(message, "🛑 Pehle channel join karein!", reply_markup=fsub_keyboard())
-            return
-
-        msg = bot.reply_to(message, "🎁 **Promo Code enter karein:**")
-        bot.register_next_step_handler(msg, claim_promo)
-    except Exception as e:
-        logging.error(f"Error in ask_promo: {e}")
-
-def claim_promo(message):
-    try:
-        if not message.text: 
-            bot.reply_to(message, "❌ Invalid text format.")
-            return
-            
-        if is_menu_button(message.text):
-            bot.reply_to(message, "❌ Action Cancelled.")
-            return
-
-        user_id = str(message.from_user.id)
-        get_user(user_id) 
-        
-        code = message.text.strip().upper()
-        success = False
-        amount = 0
-        error_msg = ""
-        
-        with db_lock:
-            if code in db["promos"]:
-                promo = db["promos"][code]
-                if user_id in promo["used_by"]:
-                    error_msg = "❌ Aap yeh promo code pehle hi use kar chuke hain."
-                elif promo["uses"] > 0:
-                    promo["uses"] -= 1
-                    promo["used_by"].append(user_id)
-                    db["users"][user_id]["balance"] += promo["amount"]
-                    success = True
-                    amount = promo["amount"]
-                    save_data(db)
-                else:
-                    error_msg = "❌ Yeh promo code expire ho chuka hai ya limit khatam ho gayi hai."
-            else:
-                error_msg = "❌ Invalid Promo Code!"
-                
-        if success:
-            bot.reply_to(message, f"🎉 **Congratulations!**\nAapne promo code claim kar liya hai. **₹{amount}** aapke wallet mein add kar diye gaye hain!")
-        else:
-            bot.reply_to(message, error_msg)
-            
-    except Exception as e:
-        logging.error(f"Error in claim_promo: {e}")
 
 @bot.message_handler(func=lambda m: m.text == "💸 Withdraw")
 def withdraw(message):
@@ -362,226 +355,293 @@ def withdraw(message):
             return
 
         u = get_user(user_id)
+        min_w = db["config"]["min_withdraw"]
         
         if not u["upi"]:
             bot.reply_to(message, "❌ Pehle apna UPI ID bind karein '🏦 Bind UPI' button se.")
             return
         
-        if u["balance"] < 190:
-            bot.reply_to(message, f"❌ **Minimum withdrawal ₹190 hai.**\nAapka current balance sirf ₹{u['balance']:.2f} hai.")
+        if u["balance"] < min_w:
+            bot.reply_to(message, f"❌ **Minimum withdrawal ₹{min_w} hai.**\nAapka current balance sirf ₹{u['balance']:.2f} hai.")
             return
+
+        # Check if already has pending withdrawal
+        for pending in db.get("pending_withdrawals", []):
+            if pending["user_id"] == user_id:
+                bot.reply_to(message, "⏳ Aapka ek withdrawal already pending hai. Please wait.")
+                return
 
         amount = u["balance"]
         tax = amount * 0.05
         final_amount = amount - tax
-        upi_id = u["upi"]
-
-        admin_text = (
-            f"🚨 **New Withdrawal Alert!**\n\n"
-            f"👤 User ID: `{user_id}`\n"
-            f"💰 Total Amount: ₹{amount:.2f}\n"
-            f"💳 To Pay (after tax): ₹{final_amount:.2f}\n"
-            f"🏦 UPI: `{upi_id}`\n\n"
-            f"👇 Approve (Starts 110-min countdown):\n"
-            f"`/pay {user_id} {final_amount:.2f} {upi_id}`"
-        )
-        
-        try:
-            bot.send_message(OWNER_ID, admin_text)
-        except Exception as admin_err:
-            bot.reply_to(message, "❌ Server busy hai (Admin Notification Failed). Aapka balance safe hai, kripya thodi der mein try karein.")
-            logging.error(f"Admin notify failed: {admin_err}")
-            return
+        req_id = f"W_{int(time.time())}"
 
         with db_lock:
             db["users"][user_id]["balance"] = 0.0
+            
+            if "pending_withdrawals" not in db:
+                db["pending_withdrawals"] = []
+                
+            db["pending_withdrawals"].append({
+                "req_id": req_id,
+                "user_id": user_id,
+                "amount": amount,
+                "final_amount": final_amount,
+                "upi": u["upi"],
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
             save_data(db)
 
         bot.reply_to(message, f"⏳ **Withdrawal Request Submitted!**\n\n"
-                              f"💰 **Amount Requested:** ₹{amount:.2f}\n"
-                              f"🧾 **Platform Tax (5%):** ₹{tax:.2f}\n"
-                              f"💳 **Receiving Amount:** ₹{final_amount:.2f}\n"
-                              f"🏦 **UPI ID:** `{upi_id}`\n\n"
-                              f"⚠️ *Aapka withdrawal pending hai. Isey cancel nahi kiya jaa sakta. Kripya wait karein.*")
+                              f"💰 **Amount:** ₹{amount:.2f}\n"
+                              f"💳 **Receiving:** ₹{final_amount:.2f} (After 5% Tax)\n"
+                              f"🏦 **UPI:** `{u['upi']}`\n\n"
+                              f"⚠️ *Aapki request admin ke paas bhej di gayi hai. Approve hote hi aapko message aayega.*")
+                              
+        # Notify Admin
+        try:
+            bot.send_message(OWNER_ID, f"🚨 **New Withdrawal Request!**\nUser: `{user_id}`\nAmount: ₹{final_amount:.2f}\nCheck Admin Panel -> Pending Withdrawals.")
+        except:
+            pass
 
     except Exception as e:
         logging.error(f"Error in withdraw: {e}")
 
 # ==========================================
-# 👑 ADMIN PANEL COMMANDS
+# 👑 INTERACTIVE ADMIN PANEL
 # ==========================================
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
-    try:
-        if str(message.from_user.id) != str(OWNER_ID):
-            return
+    if str(message.from_user.id) != str(OWNER_ID):
+        return
+    
+    with db_lock:
+        total_users = len(db["users"])
+        total_balance = sum(u["balance"] for u in db["users"].values())
+        pending_reqs = len(db.get("pending_withdrawals", []))
+    
+    text = (
+        f"👑 **DhanSahi Premium Admin Panel** 👑\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👥 **Total Users:** {total_users}\n"
+        f"💰 **Total Balances:** ₹{total_balance:.2f}\n"
+        f"⏳ **Pending Withdrawals:** {pending_reqs}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👇 Options select karein:"
+    )
+    bot.reply_to(message, text, reply_markup=admin_main_menu())
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_"))
+def admin_callbacks(call):
+    if str(call.from_user.id) != str(OWNER_ID):
+        return
         
-        with db_lock:
-            total_users = len(db["users"])
-            total_balance = sum(u["balance"] for u in db["users"].values())
+    action = call.data
+    
+    if action == "adm_fsub":
+        msg = bot.send_message(call.message.chat.id, "📢 **Set FSub Channel**\n\nFormat bhejein (Space ke saath):\n`@channelusername https://t.me/channel`\n\n*(Type /cancel to abort)*")
+        bot.register_next_step_handler(msg, admin_process_fsub)
         
+    elif action == "adm_edit_bal":
+        msg = bot.send_message(call.message.chat.id, "💰 **Edit Balance**\n\nFormat bhejein:\n`USER_ID AMOUNT`\n(e.g., `123456789 50` add karne ke liye, `123456789 -50` minus ke liye)\n\n*(Type /cancel to abort)*")
+        bot.register_next_step_handler(msg, admin_process_edit_bal)
+        
+    elif action == "adm_promo":
+        msg = bot.send_message(call.message.chat.id, "🎁 **Create Promo**\n\nFormat bhejein:\n`CODE AMOUNT USES`\n(e.g., `DIWALI50 50 10`)\n\n*(Type /cancel to abort)*")
+        bot.register_next_step_handler(msg, admin_process_promo)
+        
+    elif action == "adm_broadcast":
+        msg = bot.send_message(call.message.chat.id, "📣 **Broadcast Message**\n\nJo message sabko bhejna hai wo type karein.\n*(Text, Photo, etc supported nahi hai abhi, sirf Text bhejein)*\n\n*(Type /cancel to abort)*")
+        bot.register_next_step_handler(msg, admin_process_broadcast)
+        
+    elif action == "adm_withdrawals":
+        show_pending_withdrawals(call.message.chat.id)
+
+def show_pending_withdrawals(chat_id):
+    reqs = db.get("pending_withdrawals", [])
+    if not reqs:
+        bot.send_message(chat_id, "✅ Koi pending withdrawals nahi hain!")
+        return
+        
+    bot.send_message(chat_id, f"👀 **Showing {len(reqs)} Pending Requests:**")
+    for req in reqs:
         text = (
-            f"👑 **DhanSahi Admin Panel** 👑\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"👥 **Total Users:** {total_users}\n"
-            f"💰 **Total Balance in System:** ₹{total_balance:.2f}\n\n"
-            f"🛠️ **Admin Commands:**\n"
-            f"`/setchannel @username https://link` - Set FSub Channel\n"
-            f"`/makepromo CODE AMOUNT USES` - Create a new promo\n"
-            f"`/pay USER_ID AMOUNT UPI` - Start 110m delay payout timer"
+            f"🧾 **Req ID:** `{req['req_id']}`\n"
+            f"👤 **User:** `{req['user_id']}`\n"
+            f"💰 **Total:** ₹{req['amount']}\n"
+            f"💳 **To Pay:** ₹{req['final_amount']}\n"
+            f"🏦 **UPI:** `{req['upi']}`\n"
+            f"📅 **Date:** {req['date']}"
         )
-        bot.reply_to(message, text)
-    except Exception as e:
-        logging.error(f"Error in admin_panel: {e}")
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("✅ Approve", callback_data=f"pay_approve_{req['req_id']}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"pay_reject_{req['req_id']}")
+        )
+        bot.send_message(chat_id, text, reply_markup=markup)
 
-@bot.message_handler(commands=['setchannel'])
-def set_channel(message):
-    try:
-        if str(message.from_user.id) != str(OWNER_ID): return
-        args = message.text.split()
-        if len(args) < 3:
-            bot.reply_to(message, "❌ Format Error. Use:\n`/setchannel @yourchannel https://t.me/yourchannel`")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
+def process_payout_action(call):
+    if str(call.from_user.id) != str(OWNER_ID):
+        return
+        
+    parts = call.data.split("_")
+    action = parts[1] # approve or reject
+    req_id = parts[2]
+    
+    with db_lock:
+        reqs = db.get("pending_withdrawals", [])
+        target_req = next((r for r in reqs if r["req_id"] == req_id), None)
+        
+        if not target_req:
+            bot.answer_callback_query(call.id, "❌ Request nahi mili (Already processed).", show_alert=True)
+            bot.delete_message(call.message.chat.id, call.message.message_id)
             return
-
-        channel_id = args[1]
-        channel_link = args[2]
-        with db_lock:
-            db["config"]["channel_id"] = channel_id
-            db["config"]["channel_link"] = channel_link
-            save_data(db)
-        bot.reply_to(message, f"✅ Force Subscribe updated!\nID: {channel_id}\nLink: {channel_link}\n*(Make sure bot is admin in the channel)*")
-    except Exception as e:
-        logging.error(f"Error in setchannel: {e}")
-
-@bot.message_handler(commands=['makepromo'])
-def make_promo(message):
-    try:
-        if str(message.from_user.id) != str(OWNER_ID): return
-        args = message.text.split()
-        if len(args) < 4:
-            bot.reply_to(message, "❌ Format Error. Use:\n`/makepromo CODE AMOUNT USES`")
-            return
-
-        code = args[1].upper()
-        amount = float(args[2])
-        uses = int(args[3])
-        
-        with db_lock:
-            db["promos"][code] = {
-                "amount": amount,
-                "uses": uses,
-                "used_by": []
-            }
-            save_data(db)
-        bot.reply_to(message, f"✅ **Promo Created!**\n🎟️ Code: `{code}`\n💰 Amount: ₹{amount}\n👥 Uses: {uses}")
-    except Exception as e:
-        logging.error(f"Error in makepromo: {e}")
-
-@bot.message_handler(commands=['pay'])
-def pay_user(message):
-    try:
-        if str(message.from_user.id) != str(OWNER_ID): return
-        args = message.text.split()
-        
-        if len(args) < 4:
-            bot.reply_to(message, "❌ Format Error. Use:\n`/pay USER_ID AMOUNT UPI`")
-            return
-
-        user_id = args[1]
-        amount = float(args[2])
-        upi = args[3]
-        
-        payout_id = f"pay_{int(time.time()*1000)}"
-        
-        with db_lock:
-            for p in db.get("payouts", []):
-                if str(p["user_id"]) == str(user_id):
-                    bot.reply_to(message, f"⚠️ **Duplicate Warning!**\nUser `{user_id}` ka ek payout already queue mein hai.")
-                    return
-
-            trigger_time = time.time() + 6600
             
-            db["payouts"].append({
-                "payout_id": payout_id,
-                "user_id": user_id,
-                "amount": amount,
-                "upi": upi,
-                "trigger_time": trigger_time
-            })
-            save_data(db)
+        user_id = target_req["user_id"]
         
-        bot.reply_to(message, f"✅ **Payment Queued Securely!**\nUser `{user_id}` will automatically receive the success message with masked UPI in exactly 110 minutes.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error adding payout: {e}")
-        logging.error(f"Error in pay command: {e}")
+        if action == "approve":
+            # Mask UPI
+            upi = target_req["upi"]
+            try:
+                if '@' in upi:
+                    u_part, b_part = upi.split('@', 1)
+                    masked = f"{u_part[:2]}***@{b_part}"
+                else: masked = f"***@upi"
+            except: masked = "***@upi"
+            
+            msg_to_user = f"✅ **Withdrawal Successful!**\n\nAapka **₹{target_req['final_amount']}** ka payment bhej diya gaya hai.\n🏦 **UPI:** `{masked}`"
+            admin_resp = "✅ Approved & Notified user."
+            
+        elif action == "reject":
+            # Refund money
+            if user_id in db["users"]:
+                db["users"][user_id]["balance"] += target_req["amount"]
+            msg_to_user = f"❌ **Withdrawal Rejected!**\n\nAapka ₹{target_req['amount']} reject ho gaya hai aur balance waapas wallet me add kar diya gaya hai. Kripya valid UPI dalein."
+            admin_resp = "❌ Rejected & Refunded to user."
+            
+        # Remove from pending list
+        db["pending_withdrawals"] = [r for r in reqs if r["req_id"] != req_id]
+        save_data(db)
+        
+    # Notify User
+    try:
+        bot.send_message(user_id, msg_to_user)
+    except:
+        admin_resp += " (User blocked bot, msg not sent)"
+        
+    bot.answer_callback_query(call.id, admin_resp)
+    bot.edit_message_text(f"{call.message.text}\n\n**STATUS: {action.upper()}D**", call.message.chat.id, call.message.message_id)
 
-# ==========================================
-# 🔄 BACKGROUND WORKER
-# ==========================================
-def payout_worker():
-    while True:
+# --- Admin Next Step Handlers ---
+def admin_process_fsub(message):
+    if message.text == '/cancel': return bot.reply_to(message, "❌ Cancelled")
+    try:
+        parts = message.text.split()
+        with db_lock:
+            db["config"]["channel_id"] = parts[0]
+            db["config"]["channel_link"] = parts[1]
+            save_data(db)
+        bot.reply_to(message, "✅ FSub Settings Updated!")
+    except:
+        bot.reply_to(message, "❌ Invalid format.")
+
+def admin_process_edit_bal(message):
+    if message.text == '/cancel': return bot.reply_to(message, "❌ Cancelled")
+    try:
+        parts = message.text.split()
+        uid = parts[0]
+        amt = float(parts[1])
+        with db_lock:
+            if uid in db["users"]:
+                db["users"][uid]["balance"] += amt
+                save_data(db)
+                bot.reply_to(message, f"✅ Balance of {uid} updated. New Balance: ₹{db['users'][uid]['balance']:.2f}")
+            else:
+                bot.reply_to(message, "❌ User not found in database.")
+    except:
+        bot.reply_to(message, "❌ Invalid format.")
+
+def admin_process_promo(message):
+    if message.text == '/cancel': return bot.reply_to(message, "❌ Cancelled")
+    try:
+        parts = message.text.split()
+        code = parts[0].upper()
+        amt = float(parts[1])
+        uses = int(parts[2])
+        with db_lock:
+            db["promos"][code] = {"amount": amt, "uses": uses, "used_by": []}
+            save_data(db)
+        bot.reply_to(message, f"✅ Promo `{code}` created for ₹{amt} ({uses} uses).")
+    except:
+        bot.reply_to(message, "❌ Invalid format.")
+
+def admin_process_broadcast(message):
+    if message.text == '/cancel': return bot.reply_to(message, "❌ Cancelled")
+    
+    text = message.text
+    bot.reply_to(message, "⏳ Broadcast started. This may take a while depending on users...")
+    
+    success = 0
+    failed = 0
+    
+    with db_lock:
+        users = list(db["users"].keys())
+        
+    for uid in users:
         try:
-            current_time = time.time()
-            triggered_payouts = []
+            bot.send_message(uid, f"📢 **Broadcast from Admin:**\n\n{text}")
+            success += 1
+            time.sleep(0.05) # Avoid Telegram rate limits
+        except:
+            failed += 1
             
-            with db_lock:
-                for p in db.get("payouts", []):
-                    if current_time >= p["trigger_time"]:
-                        triggered_payouts.append(p)
-            
-            processed_ids = []
-            for p in triggered_payouts:
-                user_id = p["user_id"]
-                amount = p["amount"]
-                masked_upi = mask_upi(p["upi"])
-                p_id = p["payout_id"]
-                
-                success_text = (
-                    f"✅ **Withdrawal Successfully Completed!**\n\n"
-                    f"Dear user, aapka **₹{amount}** ka withdrawal successfully process ho gaya hai.\n\n"
-                    f"🏦 **Sent to:** `{masked_upi}`\n\n"
-                    f"🎉 Keep referring and earning with DhanSahi!"
-                )
-                
-                try:
-                    bot.send_message(user_id, success_text)
-                    bot.send_message(OWNER_ID, f"✅ Auto-Success MSG Sent to `{user_id}` for ₹{amount} to `{masked_upi}`.")
-                except Exception as e:
-                    logging.error(f"Worker Msg Error for {user_id}: {e}")
-                    bot.send_message(OWNER_ID, f"❌ User {user_id} ne bot block kar diya hai, par queue clear ho jayegi.")
-                
-                processed_ids.append(p_id)
-                
-            if processed_ids:
-                with db_lock:
-                    new_payouts = [p for p in db.get("payouts", []) if p["payout_id"] not in processed_ids]
-                    db["payouts"] = new_payouts
-                    save_data(db)
-                    
-        except Exception as e:
-            logging.error(f"Worker Error: {e}")
-            
-        time.sleep(30) 
+    bot.send_message(message.chat.id, f"✅ **Broadcast Complete!**\nSuccess: {success}\nFailed/Blocked: {failed}")
+
+# Promo Code User Handler (Kept outside admin block)
+@bot.message_handler(func=lambda m: m.text == "🎁 Claim Promo")
+def ask_promo(message):
+    if not check_fsub(message.from_user.id): return bot.reply_to(message, "🛑 Pehle channel join karein!", reply_markup=fsub_keyboard())
+    msg = bot.reply_to(message, "🎁 **Promo Code enter karein:**")
+    bot.register_next_step_handler(msg, claim_promo)
+
+def claim_promo(message):
+    if not message.text or is_menu_button(message.text): return bot.reply_to(message, "❌ Cancelled.")
+    user_id = str(message.from_user.id)
+    code = message.text.strip().upper()
+    
+    with db_lock:
+        if code in db["promos"]:
+            promo = db["promos"][code]
+            if user_id in promo["used_by"]:
+                bot.reply_to(message, "❌ Aap yeh promo code pehle hi use kar chuke hain.")
+            elif promo["uses"] > 0:
+                promo["uses"] -= 1
+                promo["used_by"].append(user_id)
+                db["users"][user_id]["balance"] += promo["amount"]
+                save_data(db)
+                bot.reply_to(message, f"🎉 **Congratulations!**\n**₹{promo['amount']}** aapke wallet mein add kar diye gaye hain!")
+            else:
+                bot.reply_to(message, "❌ Yeh promo code expire ho chuka hai.")
+        else:
+            bot.reply_to(message, "❌ Invalid Promo Code!")
 
 # ==========================================
 # 🚀 MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    logging.info("🚀 Starting DhanSahi Premium Bot...")
+    logging.info("🚀 Starting DhanSahi Premium Bot v2...")
     
     try:
         bot.remove_webhook()
         logging.info("Cleared previous webhooks.")
     except Exception as e:
-        logging.error(f"Could not remove webhook: {e}")
+        pass
 
-    worker_thread = threading.Thread(target=payout_worker, daemon=True)
-    worker_thread.start()
-    
     while True:
         try:
             logging.info("🤖 Bot is Polling...")
-            bot.infinity_polling(timeout=20, long_polling_timeout=20)
+            bot.infinity_polling(timeout=60, long_polling_timeout=60)
         except Exception as e:
-            logging.error(f"Polling Network Exception: {e}. Reconnecting in 3 seconds...")
+            logging.error(f"Polling Network Exception: {e}. Reconnecting...")
             time.sleep(3)
